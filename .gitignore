@@ -1,0 +1,6 @@
+test*
+*.txt
+*.jpg
+__py*
+.vscode
+__pacache__
