@@ -6,8 +6,9 @@ import tools
 class YOLOv1(torch.nn.Module):
     def __init__(self, batch_size=16, num_classes=20, pretrained=True):
         super(YOLOv1, self).__init__()
-        self.backborn = timm.create_model('darknet53', pretrained=pretrained, num_classes=num_classes)
+        self.backborn = timm.create_model('darknet53', pretrained=pretrained, features_only=True)
         self.backborn.head = torch.nn.Sequential(
+            torch.nn.AdaptiveAvgPool2d((7, 7)),  # 強制輸出 7x7
             torch.nn.Flatten(),
             torch.nn.Linear(1024 * 7 * 7, 496),
             torch.nn.LeakyReLU(0.1, inplace=True),
@@ -15,10 +16,16 @@ class YOLOv1(torch.nn.Module):
         )
 
     def forward(self, x):
-        return self.backborn(x)
+        out = self.backborn(x)
+        return out.view(-1, 7, 7, 30)
 
 class YOLOv1Loss(torch.nn.Module):
-    def __init__(self, batch_size=16, num_classes=20, lambda_coord=5, lambda_noobj=0.5):
+    def __init__(s  elf, batch_size=16, 
+                 num_classes=20, 
+                 lambda_coord=5, 
+                 lambda_obj =1, 
+                 lambda_noobj=0.5,
+                 lambda_class=1, ):
         super(YOLOv1Loss, self).__init__()
         self.batch_size = batch_size
         self.num_classes = num_classes
@@ -27,7 +34,7 @@ class YOLOv1Loss(torch.nn.Module):
 
     def coordinate_loss(self, pred_xywh, true_xywh):
         coord_loss = torch.sum((pred_xywh - true_xywh) ** 2, dim=4)
-        return self.lambda_coord * coord_loss
+        return (self.lambda_obj) * coord_loss
 
     def object_loss(self, iou, pred_conf):
         return self.lambda_coord * torch.sum((pred_conf - iou) ** 2, dim=3, keepdim=True)
@@ -41,7 +48,7 @@ class YOLOv1Loss(torch.nn.Module):
         # 調整 pred_classes 的形狀為 (batch_size, num_classes, height, width)
         pred_classes = pred_classes.permute(0, 3, 1, 2)  # (16, 7, 7, 20) -> (16, 20, 7, 7)
 
-        class_loss = self.lambda_coord * nn.functional.cross_entropy(pred_classes, true_classes, reduction='none')
+        class_loss = self.lambda_class * nn.functional.cross_entropy(pred_classes, true_classes, reduction='none')
         return class_loss
     def forward(self, y_pred, y_true):
         
@@ -62,9 +69,16 @@ class YOLOv1Loss(torch.nn.Module):
 
         conf_pred = y_pred[..., 28:].view(-1, 7, 7, 2)
         iou_between_pred_true_box = tools.calc_iou(ypred_bbox, ytrue_bbox).to(y_pred.device)
-        iou_max, _ = torch.max(iou_between_pred_true_box, dim=-1, keepdim=True)
-        iou_mask = (iou_between_pred_true_box == iou_max).float() * conf_pred
-        object_mask = respon_mask * iou_mask
+        # iou_between_pred_true_box: (B, 7, 7, 2)
+        best_box = torch.argmax(iou_between_pred_true_box, dim=-1)  # shape: (B, 7, 7)
+
+        # one-hot 轉成 mask: (B, 7, 7, 2)
+        object_mask = torch.nn.functional.one_hot(best_box, num_classes=2).float()
+
+        # 把 mask 跟 respon_mask 結合，respon_mask shape: (B, 7, 7, 1)
+        object_mask = object_mask * respon_mask  # shape: (B, 7, 7, 2)
+
+        # 反過來是 no-object
         noobject_mask = 1 - object_mask
 
         coord_loss = torch.sum(self.coordinate_loss(ypred_bbox_offset, ytrue_bbox_offset) * object_mask, dim=-1)
