@@ -2,27 +2,37 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import ResNet50_Weights, resnet50
-import timm
 import tools
+import timm
 
 
 class YOLOv1(nn.Module):
     def __init__(self, num_classes: int = 20, B: int = 2,
                  pretrained: bool = True, S: int = 7,
-                 backbone_name: str = "darknet53.c2ns_in1k"):
+                 backbone_name: str = "resnet50"):
         super().__init__()
         self.S = S
         self.B = B
         self.C = num_classes
 
-        # 1) timm Darknet53 backbone，直接取最後一層 feature map（stride 32 → 14x14 for 448）
-        self.backbone = timm.create_model(
-            backbone_name,
-            pretrained=pretrained,
-            features_only=True,
-            out_indices=[-1],
-        )
-        in_ch = self.backbone.feature_info.channels()[-1]
+        # 1) backbone 可選：預設 resnet50（為了相容舊權重），或 timm 的 darknet53 等
+        self.backbone_name = backbone_name.lower()
+        if self.backbone_name == "resnet50":
+            weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained else None
+            resnet = resnet50(weights=weights)
+            self.backbone = nn.Sequential(*list(resnet.children())[:-2])
+            in_ch = resnet.fc.in_features
+            self.backbone_returns_list = False
+        else:
+            # timm backbone，需 features_only=True 才能拿到最終 conv feature
+            self.backbone = timm.create_model(
+                backbone_name,
+                pretrained=pretrained,
+                features_only=True,
+                out_indices=[-1],
+            )
+            in_ch = self.backbone.feature_info.channels()[-1]
+            self.backbone_returns_list = True
 
         # 2) 若輸入 448 → 最後一層會是 14x14，需壓成 7x7
         #    用 AvgPool2d/MaxPool2d 都可以，看你喜好
@@ -36,8 +46,8 @@ class YOLOv1(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # backbone 回傳 list，取最後一個階段的 feature
-        feat = self.backbone(x)[0]       # (B, C, H, W)
+        # backbone 可能回傳 list (timm features_only) 或單一 tensor
+        feat = self.backbone(x)[0] if self.backbone_returns_list else self.backbone(x)
 
         H, W = feat.shape[2], feat.shape[3]
 
@@ -173,7 +183,7 @@ class YOLOv1Head(nn.Module):
                  numOfBox=2,
                  class_num=20,
                  iou_threshold=0.5,
-                 scores_threshold=0.05,
+                 scores_threshold=0.0,
                  apply_nms=True,
                  yolo_img_size=(224, 224),
                  name='yolov1_head'):

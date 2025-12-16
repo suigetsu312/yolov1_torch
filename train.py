@@ -1,7 +1,8 @@
 import os
+import argparse
+from datetime import datetime
 import torch
 import torch.optim as optim
-from torchvision import transforms
 from torchvision.transforms import Compose, ToTensor, Normalize, ColorJitter
 from torch.utils.tensorboard import SummaryWriter
 
@@ -23,12 +24,22 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, global_step, check
     print(f"[Checkpoint] saved at epoch {epoch+1}: {checkpoint_path}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="YOLOv1 Training")
+    parser.add_argument("--exp-name", type=str, default=None,
+                        help="實驗名稱；若不指定則用日期時間自動生成")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    exp_name = args.exp_name or datetime.now().strftime("exp_%Y%m%d_%H%M%S")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Using device:", device)
 
     EPOCHS = 135
-    BASE_LR = 1e-2
+    BASE_LR = 5e-3   # 主體階段 LR（batch 64 時更保守，搭配 warmup）
     TRAIN_TXT = "/home/natsu/dataset/VOC0712_merged/train.txt"
     VAL_TXT   = "/home/natsu/dataset/VOC0712_merged/test.txt"
     BS_TRAIN = 16     # 實際 batch
@@ -40,13 +51,17 @@ def main():
     # 等比例縮放 LR：目標有效 batch ~64，原 base LR 0.01 → scale = (BS*ACCUM)/64
     LR_SCALE = (BS_TRAIN * ACCUM_STEPS) / 64.0
     LR = BASE_LR * LR_SCALE
-    RESUME_PATH = "checkpoints/last.pth"
+
+    # 實驗專用路徑
+    ckpt_dir = os.path.join("checkpoints", exp_name)
+    log_dir = os.path.join("runs", exp_name)
+    os.makedirs(ckpt_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+    RESUME_PATH = os.path.join(ckpt_dir, "last.pth")
 
     train_transform = Compose([
         tools.BGR2RGB(),
         ToTensor(),
-        # 輕量 affine 讓比例/位置更隨機，貼近參考版的平移縮放
-        transforms.RandomAffine(degrees=5, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=2),
         ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
         Normalize(mean=[0.485, 0.456, 0.406],
                   std=[0.229, 0.224, 0.225])
@@ -63,22 +78,24 @@ def main():
         txt_sample_path=TRAIN_TXT,
         transform=train_transform,
         img_size=IMG_SIZE,
-        hflip_prob=0.5
+        hflip_prob=0.5,
+        affine_prob=0.5
     )
-    train_loader = train_dataset.create_dataloader(batch_size=BS_TRAIN, shuffle=True)
+    train_loader = train_dataset.create_dataloader(batch_size=BS_TRAIN, shuffle=True, num_workers=16)
 
     val_dataset = pascal_dataloader.PascalDataset(
         txt_sample_path=VAL_TXT,
         transform=val_transform,
         img_size=IMG_SIZE,
-        hflip_prob=0.0   # 驗證不做增強
+        hflip_prob=0.0,
+        affine_prob=0.0   # 驗證不做增強
     )
-    val_loader = val_dataset.create_dataloader(batch_size=BS_VAL, shuffle=False)
+    val_loader = val_dataset.create_dataloader(batch_size=BS_VAL, shuffle=False, num_workers=8)
 
-    net = model.YOLOv1().to(device)
+    net = model.YOLOv1(backbone_name="resnet50").to(device)
     criterion = model.YOLOv1Loss()
     optimizer = optim.SGD(net.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
-    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[75, 105], gamma=0.1)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[70, 100], gamma=0.1)
     warmup_epochs = 3
 
     start_epoch = 0
@@ -96,10 +113,8 @@ def main():
 
     head = model.YOLOv1Head(orig_img_size=(IMG_SIZE, IMG_SIZE),
                             iou_threshold=0.5,
-                            scores_threshold=0.05)  # head 沒參數，不用放 device
+                            scores_threshold=0.0)  # head 沒參數，不用放 device
 
-    log_dir = "runs/yolov1_voc"
-    os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
     # 若從 checkpoint 恢復，global_step 已在上方載入
     for epoch in range(start_epoch, EPOCHS):
@@ -149,8 +164,7 @@ def main():
             print(f"[Epoch {epoch+1}/{EPOCHS}] Val mAP@0.5: {val_map:.4f}")
 
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == EPOCHS:
-            ckpt_path = os.path.join("checkpoints", f"yolov1_epoch_{epoch+1}.pth")
-            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            ckpt_path = os.path.join(ckpt_dir, f"epoch_{epoch+1}.pth")
             save_checkpoint(net, optimizer, scheduler, epoch, avg_loss, global_step, ckpt_path)
             save_checkpoint(net, optimizer, scheduler, epoch, avg_loss, global_step, RESUME_PATH)
 

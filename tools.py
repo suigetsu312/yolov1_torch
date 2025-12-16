@@ -149,22 +149,21 @@ def targets_to_boxes(y_true, S=7, B=2, num_classes=20, img_size=224, device=None
 
 def voc_ap(recalls, precisions):
     """
-    Compute AP with the VOC 2010 style (integrate precision envelope).
+    VOC2007 11-point AP: 對 recall 門檻 {0,0.1,...,1} 取 precision 最大值的平均。
     recalls, precisions: 1D tensors sorted by descending score.
     """
     device = recalls.device
-    mrec = torch.cat([torch.tensor([0.0], device=device), recalls, torch.tensor([1.0], device=device)])
-    mpre = torch.cat([torch.tensor([0.0], device=device), precisions, torch.tensor([0.0], device=device)])
-
-    # Precision envelope
+    # precision envelope
+    mpre = precisions.clone()
     for i in range(mpre.size(0) - 2, -1, -1):
         mpre[i] = torch.maximum(mpre[i], mpre[i + 1])
 
-    # Summation over recall steps
-    idx = torch.nonzero(mrec[1:] != mrec[:-1], as_tuple=False).squeeze()
-    if idx.numel() == 0:
-        return 0.0
-    ap = torch.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
+    ap = 0.0
+    for t in torch.arange(0.0, 1.01, 0.1, device=device):
+        mask = recalls >= t
+        p = mpre[mask].max() if mask.any() else torch.tensor(0.0, device=device)
+        ap += p
+    ap /= 11.0
     return ap.item()
 
 
@@ -238,7 +237,7 @@ def compute_map_single_image(pred_boxes, gt_boxes, num_classes=20, iou_thr=0.5, 
 def evaluate_map(model, head, dataloader, device, num_classes=20,
                  img_size=224, iou_thr=0.5, return_per_class=False):
     """
-    Pascal VOC 2007 樣式的 mAP@iou_thr（dataset-level）：
+    Pascal VOC 2007 11-point mAP@iou_thr（dataset-level）：
     - 將所有圖片的 pred/gt 彙整後，逐類別排序計算 TP/FP，再做 11-point AP。
     - batch_size 建議 1，若非 1 也會一張張處理。
     """

@@ -6,7 +6,9 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader, Subset
 
 class PascalDataset(Dataset):
-    def __init__(self, txt_sample_path, transform=None, S=7, B=2, classes=20, label_dir=None, img_size=448, hflip_prob=0.5):
+    def __init__(self, txt_sample_path, transform=None, S=7, B=2, classes=20, label_dir=None,
+                 img_size=448, hflip_prob=0.5,
+                 affine_prob=0.5, affine_scale=(0.9, 1.1), affine_translate=0.1):
         # 類別名稱及其對應的 ID
         self.classes_name = [
             "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", 
@@ -23,6 +25,9 @@ class PascalDataset(Dataset):
         self.txt_sample_path = os.path.expanduser(txt_sample_path)
         self.img_size = img_size
         self.hflip_prob = hflip_prob
+        self.affine_prob = affine_prob
+        self.affine_scale = affine_scale
+        self.affine_translate = affine_translate
 
         # 讀取 train.txt
         with open(self.txt_sample_path, 'r') as f:
@@ -73,18 +78,73 @@ class PascalDataset(Dataset):
         with open(label_path, 'r') as f:
             lines = [line.strip() for line in f.readlines()]
 
+        # 先解析成物件列表，方便做幾何增強時同步調整 bbox
+        objects = []
+        for line in lines:
+            class_id, x_center, y_center, width, height = self.split_object(line)
+            objects.append([class_id, x_center, y_center, width, height])
+
+        # 水平翻轉
         do_flip = random.random() < self.hflip_prob
         if do_flip:
             image = cv.flip(image, 1)  # 水平翻轉
+            for obj in objects:
+                obj[1] = 1.0 - obj[1]  # x_center
 
-        for line in lines:
-            class_id, x_center, y_center, width, height = self.split_object(line)
+        # 輕量縮放/平移仿射，縮放 + 平移對應到 bbox 座標（保持 448x448 尺寸）
+        if random.random() < self.affine_prob:
+            scale = random.uniform(*self.affine_scale)
+            translate_frac = self.affine_translate
+            tx = random.uniform(-translate_frac, translate_frac)
+            ty = random.uniform(-translate_frac, translate_frac)
 
-            if do_flip:
-                x_center = 1.0 - x_center  # flip 後的中心
+            M = np.array([
+                [scale, 0, tx * self.img_size],
+                [0, scale, ty * self.img_size]
+            ], dtype=np.float32)
+            image = cv.warpAffine(
+                image,
+                M,
+                (self.img_size, self.img_size),
+                flags=cv.INTER_LINEAR,
+                borderMode=cv.BORDER_CONSTANT,
+                borderValue=(114, 114, 114)
+            )
 
+            transformed = []
+            for cls_id, xc, yc, w, h in objects:
+                xc = scale * xc + tx
+                yc = scale * yc + ty
+                w = w * scale
+                h = h * scale
+                x1 = xc - w / 2.0
+                y1 = yc - h / 2.0
+                x2 = xc + w / 2.0
+                y2 = yc + h / 2.0
+                # clip 到 [0,1]
+                x1 = max(0.0, x1)
+                y1 = max(0.0, y1)
+                x2 = min(1.0, x2)
+                y2 = min(1.0, y2)
+                new_w = x2 - x1
+                new_h = y2 - y1
+                if new_w <= 0 or new_h <= 0:
+                    continue
+                new_xc = (x1 + x2) / 2.0
+                new_yc = (y1 + y2) / 2.0
+                transformed.append([cls_id, new_xc, new_yc, new_w, new_h])
+            objects = transformed
+
+        # 初始化標籤矩陣
+        label = np.zeros((self.S, self.S, 5 * self.B + self.classes))
+
+        for class_id, x_center, y_center, width, height in objects:
+            if x_center <= 0.0 or x_center >= 1.0 or y_center <= 0.0 or y_center >= 1.0:
+                continue
             grid_x = int(self.S * x_center)
             grid_y = int(self.S * y_center)
+            if grid_x < 0 or grid_x >= self.S or grid_y < 0 or grid_y >= self.S:
+                continue
             cell_x = x_center * self.S - grid_x
             cell_y = y_center * self.S - grid_y
             conf_start = self.classes + 4 * self.B  # 28
@@ -119,7 +179,7 @@ class PascalDataset(Dataset):
         bbox = list(map(float, values[1:]))
         return [class_id] + bbox
 
-    def create_dataloader(self, batch_size, shuffle=True, num_workers=4, limit=None):
+    def create_dataloader(self, batch_size, shuffle=True, num_workers=8, limit=None):
         """
         創建 DataLoader。
         """
@@ -128,7 +188,15 @@ class PascalDataset(Dataset):
             limit = min(limit, len(self))
             indices = list(range(limit))  # 固定前 limit 筆，便於小集合過擬合測試
             dataset = Subset(self, indices)
-        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+        return DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            num_workers=num_workers,
+            pin_memory=True,
+            prefetch_factor=2,
+            persistent_workers=num_workers > 0,
+        )
 if __name__ == "__main__":
     dataset = PascalDataset(
         txt_sample_path="~/dataset/VOC2012/train.txt",
