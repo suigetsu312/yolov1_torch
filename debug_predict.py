@@ -87,7 +87,7 @@ def main():
                         help="從 txt 列表隨機選擇 n 張圖片（當未指定 --image 且未指定 --index 時使用）。")
     parser.add_argument("--seed", type=int, default=0, help="隨機選取圖片時的種子。")
     parser.add_argument("--label", default=None, help="標籤檔路徑；若未提供會自動猜測。")
-    parser.add_argument("--checkpoint", default="/home/natsu/project/DL/yolov1_torch/checkpoints/archive_20251216_152453/yolov1_epoch_120.pth", help="模型 checkpoint 路徑。")
+    parser.add_argument("--checkpoint", default="/home/natsu/project/DL/yolov1_torch/checkpoints/exp_20251216_193546/last.pth", help="模型 checkpoint 路徑。")
     parser.add_argument("--img-size", type=int, default=448, help="輸入尺寸，會對圖片 resize。")
     parser.add_argument("--score-thr", type=float, default=0.2, help="分數門檻。")
     parser.add_argument("--iou-thr", type=float, default=0.45, help="NMS IoU 門檻。")

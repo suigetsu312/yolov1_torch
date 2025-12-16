@@ -8,7 +8,9 @@ from torch.utils.data import Dataset, DataLoader, Subset
 class PascalDataset(Dataset):
     def __init__(self, txt_sample_path, transform=None, S=7, B=2, classes=20, label_dir=None,
                  img_size=448, hflip_prob=0.5,
-                 affine_prob=0.5, affine_scale=(0.9, 1.1), affine_translate=0.1):
+                 affine_prob=0.5, affine_scale=(0.9, 1.1), affine_translate=0.1,
+                 multi_scale_sizes=None, cutout_prob=0.0, cutout_num_range=(1, 3),
+                 cutout_size=(0.05, 0.2)):
         # 類別名稱及其對應的 ID
         self.classes_name = [
             "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", 
@@ -28,6 +30,11 @@ class PascalDataset(Dataset):
         self.affine_prob = affine_prob
         self.affine_scale = affine_scale
         self.affine_translate = affine_translate
+        # 若提供多尺度列表，只會在其中隨機選取；不提供則固定 img_size。
+        self.multi_scale_sizes = [s for s in (multi_scale_sizes or [])]
+        self.cutout_prob = cutout_prob
+        self.cutout_num_range = cutout_num_range
+        self.cutout_size = cutout_size
 
         # 讀取 train.txt
         with open(self.txt_sample_path, 'r') as f:
@@ -53,7 +60,10 @@ class PascalDataset(Dataset):
         if image is None:
             raise FileNotFoundError(f"Image not found: {img_path}")
         # 保持 uint8 讓 ToTensor 自動縮放到 [0,1]
-        image = cv.resize(image, (self.img_size, self.img_size))
+        target_size = self.img_size
+        if self.multi_scale_sizes:
+            target_size = random.choice(self.multi_scale_sizes)
+        image = cv.resize(image, (target_size, target_size))
 
         # 初始化標籤矩陣
         label = np.zeros((self.S, self.S, 5 * self.B + self.classes))
@@ -99,13 +109,13 @@ class PascalDataset(Dataset):
             ty = random.uniform(-translate_frac, translate_frac)
 
             M = np.array([
-                [scale, 0, tx * self.img_size],
-                [0, scale, ty * self.img_size]
+                [scale, 0, tx * target_size],
+                [0, scale, ty * target_size]
             ], dtype=np.float32)
             image = cv.warpAffine(
                 image,
                 M,
-                (self.img_size, self.img_size),
+                (target_size, target_size),
                 flags=cv.INTER_LINEAR,
                 borderMode=cv.BORDER_CONSTANT,
                 borderValue=(114, 114, 114)
@@ -134,6 +144,10 @@ class PascalDataset(Dataset):
                 new_yc = (y1 + y2) / 2.0
                 transformed.append([cls_id, new_xc, new_yc, new_w, new_h])
             objects = transformed
+
+        # cutout: 遮擋部分區域並將中心落在遮擋區的物件剔除
+        if self.cutout_prob > 0 and random.random() < self.cutout_prob:
+            image, objects = self._apply_cutout(image, objects)
 
         # 初始化標籤矩陣
         label = np.zeros((self.S, self.S, 5 * self.B + self.classes))
@@ -178,6 +192,36 @@ class PascalDataset(Dataset):
         class_id = int(values[0])
         bbox = list(map(float, values[1:]))
         return [class_id] + bbox
+
+    def _apply_cutout(self, image, objects):
+        """
+        在圖片上隨機遮擋區域，若物件中心落入遮擋區則丟棄該物件。
+        cutout_size: 遮擋邊長占最小邊的比例範圍
+        """
+        h, w, _ = image.shape
+        num = random.randint(self.cutout_num_range[0], self.cutout_num_range[1])
+        masks = []
+        for _ in range(num):
+            ch = random.uniform(self.cutout_size[0], self.cutout_size[1]) * h
+            cw = random.uniform(self.cutout_size[0], self.cutout_size[1]) * w
+            cx = random.uniform(0, w)
+            cy = random.uniform(0, h)
+            x1 = int(max(0, cx - cw / 2))
+            y1 = int(max(0, cy - ch / 2))
+            x2 = int(min(w, cx + cw / 2))
+            y2 = int(min(h, cy + ch / 2))
+            image[y1:y2, x1:x2] = (114, 114, 114)
+            masks.append((x1, y1, x2, y2))
+
+        kept = []
+        for obj in objects:
+            cls_id, xc, yc, bw, bh = obj
+            px = xc * w
+            py = yc * h
+            blocked = any(x1 <= px <= x2 and y1 <= py <= y2 for (x1, y1, x2, y2) in masks)
+            if not blocked:
+                kept.append(obj)
+        return image, kept
 
     def create_dataloader(self, batch_size, shuffle=True, num_workers=8, limit=None):
         """

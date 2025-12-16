@@ -1,10 +1,12 @@
 import os
 import argparse
 from datetime import datetime
+import time
 import torch
 import torch.optim as optim
 from torchvision.transforms import Compose, ToTensor, Normalize, ColorJitter
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import model
 import pascal_dataloader
@@ -48,6 +50,11 @@ def main():
     checkpoint_interval = 10    # 每 N 個 epoch 儲存 checkpoint
     IMG_SIZE = 448
     ACCUM_STEPS = 4  # 梯度累積步數（有效 batch ≈ BS_TRAIN * ACCUM_STEPS）
+    # 模型 head 目前只接受輸入 224 或 448（feature map 7x7 或 14x14），故先關閉多尺度
+    MULTI_SCALES = None
+    CUTOUT_PROB = 0.6
+    CUTOUT_NUM_RANGE = (1, 3)
+    CUTOUT_SIZE = (0.05, 0.2)
     # 等比例縮放 LR：目標有效 batch ~64，原 base LR 0.01 → scale = (BS*ACCUM)/64
     LR_SCALE = (BS_TRAIN * ACCUM_STEPS) / 64.0
     LR = BASE_LR * LR_SCALE
@@ -79,7 +86,11 @@ def main():
         transform=train_transform,
         img_size=IMG_SIZE,
         hflip_prob=0.5,
-        affine_prob=0.5
+        affine_prob=0.5,
+        multi_scale_sizes=MULTI_SCALES,
+        cutout_prob=CUTOUT_PROB,
+        cutout_num_range=CUTOUT_NUM_RANGE,
+        cutout_size=CUTOUT_SIZE
     )
     train_loader = train_dataset.create_dataloader(batch_size=BS_TRAIN, shuffle=True, num_workers=16)
 
@@ -116,6 +127,7 @@ def main():
                             scores_threshold=0.0)  # head 沒參數，不用放 device
 
     writer = SummaryWriter(log_dir=log_dir)
+    train_start_time = time.time()
     # 若從 checkpoint 恢復，global_step 已在上方載入
     for epoch in range(start_epoch, EPOCHS):
         # 論文沒有 warmup，但用較大 LR + 448 輸入時，加個簡單 warmup 稳定訓練（僅從頭訓練時啟用）
@@ -127,7 +139,9 @@ def main():
         epoch_loss_sum = 0.0
         optimizer.zero_grad()
 
-        for batch_idx, (images, labels) in enumerate(train_loader):
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Epoch {epoch+1}/{EPOCHS}", dynamic_ncols=True)
+        for batch_idx, (images, labels) in pbar:
             images = images.to(device)
             labels = labels.to(device).float()
 
@@ -143,6 +157,11 @@ def main():
             epoch_loss_sum += loss.item() * ACCUM_STEPS
             writer.add_scalar("train/loss_step", loss.item() * ACCUM_STEPS, global_step)
             global_step += 1
+            # 更新 tqdm 狀態
+            pbar.set_postfix({
+                "loss": f"{loss.item() * ACCUM_STEPS:.4f}",
+                "lr": f"{optimizer.param_groups[0]['lr']:.4f}"
+            })
 
         avg_loss = epoch_loss_sum / len(train_loader)
         writer.add_scalar("train/loss_epoch", avg_loss, epoch)

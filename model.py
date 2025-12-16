@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import ResNet50_Weights, resnet50
+from torchvision.models import (
+    ResNet50_Weights,
+    resnet50,
+    MobileNet_V2_Weights,
+    mobilenet_v2,
+)
 import tools
 import timm
 
@@ -22,6 +27,12 @@ class YOLOv1(nn.Module):
             resnet = resnet50(weights=weights)
             self.backbone = nn.Sequential(*list(resnet.children())[:-2])
             in_ch = resnet.fc.in_features
+            self.backbone_returns_list = False
+        elif self.backbone_name in ("mobilenetv2", "mobilenet_v2"):
+            weights = MobileNet_V2_Weights.IMAGENET1K_V2 if pretrained else None
+            mobilenet = mobilenet_v2(weights=weights)
+            self.backbone = mobilenet.features  # stride32，448 輸入會輸出 14x14
+            in_ch = mobilenet.last_channel       # 1280
             self.backbone_returns_list = False
         else:
             # timm backbone，需 features_only=True 才能拿到最終 conv feature
