@@ -48,9 +48,15 @@ def guess_label_path(img_path, txt_root=None):
 
 
 def draw_boxes(img, boxes, color, prefix=""):
+    h, w = img.shape[:2]
     for b in boxes:
         cid = b["cls"]
-        x1, y1, x2, y2 = map(int, b["box"])
+        x1, y1, x2, y2 = b["box"]
+        # 避免框跑出圖外
+        x1 = int(np.clip(x1, 0, w - 1))
+        y1 = int(np.clip(y1, 0, h - 1))
+        x2 = int(np.clip(x2, 0, w - 1))
+        y2 = int(np.clip(y2, 0, h - 1))
         cv.rectangle(img, (x1, y1), (x2, y2), color, 2)
         label = CLASSES[cid] if 0 <= cid < len(CLASSES) else f"id{cid}"
         text = f"{prefix}{label}"
@@ -104,21 +110,22 @@ def main():
     head = model.YOLOv1Head(orig_img_size=(args.img_size, args.img_size),
                             iou_threshold=args.iou_thr,
                             scores_threshold=args.score_thr)
+    ckpt_name = Path(args.checkpoint).name
 
     transform = build_transform()
 
     def run_one(image_path: Path, out_path: Path):
-        img = cv.imread(str(image_path))
-        if img is None:
+        img_orig = cv.imread(str(image_path))
+        if img_orig is None:
             print(f"[Warn] 讀不到圖片: {image_path}")
             return
-        img = cv.resize(img, (args.img_size, args.img_size))
-        h, w = img.shape[:2]
+        orig_h, orig_w = img_orig.shape[:2]
+        img = cv.resize(img_orig, (args.img_size, args.img_size))
 
         label_path = Path(args.label) if args.label else guess_label_path(image_path, txt_root)
         gt_boxes = []
         if label_path and label_path.exists():
-            gt_boxes = load_label(label_path, w, h)
+            gt_boxes = load_label(label_path, orig_w, orig_h)
 
         inp = transform(img).unsqueeze(0).to(device)
 
@@ -129,17 +136,30 @@ def main():
         if isinstance(pred_boxes, (list, tuple)):
             pred_boxes = pred_boxes[0]
 
+        sx = float(orig_w) / float(args.img_size)
+        sy = float(orig_h) / float(args.img_size)
         pred_list = []
         for row in pred_boxes:
             cid = int(row[0].item())
             x1, y1, x2, y2, score = row[1:].tolist()
-            pred_list.append({"cls": cid, "box": (x1, y1, x2, y2), "score": score})
+            # 將框放大回原圖尺寸
+            pred_list.append({"cls": cid,
+                              "box": (x1 * sx, y1 * sy, x2 * sx, y2 * sy),
+                              "score": score})
 
-        img_vis = img.copy()
+        img_vis = img_orig.copy()
         if gt_boxes:
             img_vis = draw_boxes(img_vis, gt_boxes, color=(0, 255, 0), prefix="gt:")
         if pred_list:
             img_vis = draw_boxes(img_vis, pred_list, color=(0, 0, 255), prefix="pred:")
+
+        # 印出類別/分數方便檢查
+        for b in pred_list:
+            cls_name = CLASSES[b["cls"]] if 0 <= b["cls"] < len(CLASSES) else f"id{b['cls']}"
+            print(f"pred {cls_name:12s} score {b['score']:.3f} box {b['box']}")
+        for b in gt_boxes:
+            cls_name = CLASSES[b["cls"]] if 0 <= b["cls"] < len(CLASSES) else f"id{b['cls']}"
+            print(f"gt   {cls_name:12s} box {b['box']}")
 
         cv.imwrite(str(out_path), img_vis)
         print(f"Saved: {out_path} (pred {len(pred_list)} boxes, gt {len(gt_boxes)})")
@@ -171,6 +191,10 @@ def main():
     for img_path in image_paths:
         out_path = out_dir / f"{img_path.stem}_pred.jpg"
         run_one(img_path, out_path)
+
+    # 記錄本次使用的 checkpoint
+    with open(out_dir / "checkpoint.txt", "w") as f:
+        f.write(str(args.checkpoint))
 
     if args.show:
         cv.destroyAllWindows()

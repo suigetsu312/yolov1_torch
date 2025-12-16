@@ -20,7 +20,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate YOLOv1 checkpoint mAP@0.5.")
     parser.add_argument("--txt", default="~/dataset/VOC0712_merged/test.txt",
                         help="包含影像路徑的 txt（例如 VOC 的 train/test 列表）。")
-    parser.add_argument("--checkpoint", default="checkpoints/yolov1_epoch_120.pth",
+    parser.add_argument("--checkpoint", default="checkpoints/archive_20251216_152453/yolov1_epoch_120.pth",
                         help="模型 checkpoint 路徑。")
     parser.add_argument("--img-size", type=int, default=448,
                         help="輸入尺寸，會對圖片 resize。")

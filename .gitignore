@@ -5,3 +5,4 @@ __py*
 __pacache__
 runs
 checkpoints/
+outputs/

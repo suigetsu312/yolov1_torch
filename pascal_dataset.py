@@ -112,28 +112,104 @@ class pascal_dataset:
         with open(cur_path, 'w+') as f:
             for sample in d_set:
                 f.write(PathBind(sample.img_path) + '\n')
-        
+
     def split_dataset(self, tr):
         random.shuffle(self.samples)
         train = self.samples[:math.floor(self.get_dataset_len() * tr)]
         test = self.samples[math.floor(self.get_dataset_len() * tr):]
         self.__save_dataset_txt(train,0)
         self.__save_dataset_txt(test,1)
-    
+
+    def split_dataset_official(self, train_ids, test_ids):
+        """
+        依照官方 ImageSets 的 id 列表分割，不再隨機切。
+        train_ids/test_ids: set of image stems (不含副檔名)
+        """
+        train = [s for s in self.samples if s.img_name in train_ids]
+        test  = [s for s in self.samples if s.img_name in test_ids]
+        print(f"官方分割: train {len(train)}, test {len(test)}")
+        self.__save_dataset_txt(train, 0)
+        self.__save_dataset_txt(test, 1)
+
+def _resolve_voc2007_test_path(voc2007_trainval: str, voc2007_test_arg: str | None) -> str:
+    """
+    如果 user 沒給 --voc2007-test，就嘗試：
+      1) 先用 trainval 路徑
+      2) 若找不到 test.txt，再嘗試將 VOCtrainval_06-Nov-2007 替換成 VOCtest_06-Nov-2007
+    """
+    if voc2007_test_arg:
+        return voc2007_test_arg
+
+    test_path = voc2007_trainval
+    test_txt = os.path.join(test_path, "ImageSets", "Main", "test.txt")
+    if os.path.isfile(test_txt):
+        return test_path
+
+    # fallback: 常見的 VOCtest 目錄名稱
+    auto_guess = voc2007_trainval.replace("VOCtrainval_06-Nov-2007", "VOCtest_06-Nov-2007")
+    test_txt_guess = os.path.join(auto_guess, "ImageSets", "Main", "test.txt")
+    if auto_guess != voc2007_trainval and os.path.isfile(test_txt_guess):
+        print(f"偵測到 VOC2007 test 資料夾：{auto_guess}")
+        return auto_guess
+
+    return test_path
+
+
 def main():
 
     parser = arg.ArgumentParser()
     parser.add_argument("--voc2007", default="~/dataset/VOC2007/VOCtrainval_06-Nov-2007/VOCdevkit/VOC2007",
-                        help="VOC2007 根目錄 (含 Annotations/JPEGImages)")
+                        help="VOC2007 trainval 根目錄 (含 Annotations/JPEGImages)")
+    parser.add_argument("--voc2007-test", default="~/dataset/VOC2007/VOCtest_06-Nov-2007/VOCdevkit/VOC2007",
+                        help="VOC2007 test 根目錄（若不指定則沿用 --voc2007）")
     parser.add_argument("--voc2012", default= "/home/natsu/dataset/VOC2012/VOC2012_train_val/VOC2012_train_val/",
-                        help="VOC2012 根目錄 (含 Annotations/JPEGImages)")
+                        help="VOC2012 trainval 根目錄 (含 Annotations/JPEGImages)")
     parser.add_argument("--out-root", default="~/dataset/VOC0712_merged", help="輸出 sample/ 與 train/test.txt 的目錄")
+    parser.add_argument("--use-official-split", action="store_true", default=True,
+                        help="使用官方 ImageSets/Main/trainval.txt 與 test.txt 分割（07 trainval+12 trainval 做訓練，07 test 做測試）")
+    parser.add_argument("--include-extra-2012", action="store_true", default=False,
+                        help="將 VOC2012 中不在官方 trainval.txt 的標註也加入 train（測試仍用 07 test）")
     args = parser.parse_args()
 
-    dataset = pascal_dataset([args.voc2007, args.voc2012], args.out_root, [448,448])
+    # 先展開路徑中的 ~，避免讀取 ImageSets 時找不到檔案
+    voc2007_trainval = PathBind(args.voc2007)
+    voc2007_test = PathBind(_resolve_voc2007_test_path(voc2007_trainval, args.voc2007_test))
+    voc2012 = PathBind(args.voc2012)
+    out_root = PathBind(args.out_root)
+
+    dataset_paths = [voc2007_trainval, voc2007_test, voc2012]
+    # 去掉重複路徑
+    dataset = pascal_dataset(list(dict.fromkeys(dataset_paths)), out_root, [448,448])
     dataset.parser()
     dataset.write2txt()
-    dataset.split_dataset(0.7)
+
+    if args.use_official_split:
+        def read_ids(list_path):
+            if not os.path.isfile(list_path):
+                raise FileNotFoundError(
+                    f"{list_path} 不存在，請確認已下載 VOC2007 test 集 (VOCtest_06-Nov-2007) "
+                    "並透過 --voc2007-test 指定其 VOCdevkit/VOC2007 路徑，或改用 --no-use-official-split 做隨機分割。"
+                )
+            with open(list_path, "r") as f:
+                return [line.strip() for line in f.readlines() if line.strip()]
+
+        ids_07_trainval = read_ids(os.path.join(voc2007_trainval, "ImageSets", "Main", "trainval.txt"))
+        ids_07_test = read_ids(os.path.join(voc2007_test, "ImageSets", "Main", "test.txt"))
+        ids_12_trainval = read_ids(os.path.join(voc2012, "ImageSets", "Main", "trainval.txt"))
+
+        train_ids = set(ids_07_trainval + ids_12_trainval)
+        if args.include_extra_2012:
+            all_12_xml = glob.glob(os.path.join(voc2012, "Annotations", "*.xml"))
+            extra_12_ids = {os.path.splitext(os.path.basename(p))[0] for p in all_12_xml} - set(ids_12_trainval)
+            if len(extra_12_ids) > 0:
+                print(f"加入 VOC2012 其他標註 {len(extra_12_ids)} 張到 train")
+                train_ids |= extra_12_ids
+
+        test_ids = set(ids_07_test)
+        print(f"使用官方分割，train ids {len(train_ids)}, test ids {len(test_ids)}")
+        dataset.split_dataset_official(train_ids, test_ids)
+    else:
+        dataset.split_dataset(0.7)
 
 if __name__ == "__main__":
     main()
