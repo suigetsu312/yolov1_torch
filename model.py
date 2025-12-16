@@ -1,46 +1,104 @@
-import torch 
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision.models import ResNet50_Weights, resnet50
 import timm
 import tools
-class YOLOv1(torch.nn.Module):
-    def __init__(self, batch_size=16, num_classes=20, pretrained=True):
-        super(YOLOv1, self).__init__()
-        self.backborn = timm.create_model('darknet53', pretrained=pretrained, features_only=True)
-        self.backborn.head = torch.nn.Sequential(
-            torch.nn.AdaptiveAvgPool2d((7, 7)),  # 強制輸出 7x7
-            torch.nn.Flatten(),
-            torch.nn.Linear(1024 * 7 * 7, 496),
-            torch.nn.LeakyReLU(0.1, inplace=True),
-            torch.nn.Linear(496, 1470),
+
+
+class YOLOv1(nn.Module):
+    def __init__(self, num_classes: int = 20, B: int = 2,
+                 pretrained: bool = True, S: int = 7,
+                 backbone_name: str = "darknet53.c2ns_in1k"):
+        super().__init__()
+        self.S = S
+        self.B = B
+        self.C = num_classes
+
+        # 1) timm Darknet53 backbone，直接取最後一層 feature map（stride 32 → 14x14 for 448）
+        self.backbone = timm.create_model(
+            backbone_name,
+            pretrained=pretrained,
+            features_only=True,
+            out_indices=[-1],
+        )
+        in_ch = self.backbone.feature_info.channels()[-1]
+
+        # 2) 若輸入 448 → 最後一層會是 14x14，需壓成 7x7
+        #    用 AvgPool2d/MaxPool2d 都可以，看你喜好
+        self.down_to_grid = nn.AvgPool2d(kernel_size=2, stride=2)
+
+        # 3) head：把 [B, C, 7, 7] → [B, B*5 + C, 7, 7]
+        self.head = nn.Sequential(
+            nn.Conv2d(in_ch, in_ch, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(in_ch, self.C + 5 * self.B, kernel_size=1),
         )
 
-    def forward(self, x):
-        out = self.backborn(x)
-        return out.view(-1, 7, 7, 30)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # backbone 回傳 list，取最後一個階段的 feature
+        feat = self.backbone(x)[0]       # (B, C, H, W)
+
+        H, W = feat.shape[2], feat.shape[3]
+
+        # 如果是 2*S x 2*S（例如 14x14），就壓成 SxS（7x7）
+        if H == 2 * self.S and W == 2 * self.S:
+            feat = self.down_to_grid(feat)
+        elif H != self.S or W != self.S:
+            # 其它情況直接爆錯，避免你以為是 7x7 結果不是
+            raise RuntimeError(
+                f"Unexpected feature map size {H}x{W}, expected {self.S}x{self.S} or {2*self.S}x{2*self.S}"
+            )
+
+        out = self.head(feat)            # (B, 30, 7, 7) if C=20,B=2,S=7
+        out = out.permute(0, 2, 3, 1)    # (B, 7, 7, 30)
+        return out
 
 class YOLOv1Loss(torch.nn.Module):
-    def __init__(s  elf, batch_size=16, 
-                 num_classes=20, 
+    def __init__(self, batch_size=16, 
+                 grid=7,
+                 numOfClasses=20,
+                 numOfBox=2,
                  lambda_coord=5, 
                  lambda_obj =1, 
                  lambda_noobj=0.5,
                  lambda_class=1, ):
         super(YOLOv1Loss, self).__init__()
+        self.numOfBox = numOfBox
+        self.numOfClasses = numOfClasses
+        self.grid = grid
         self.batch_size = batch_size
-        self.num_classes = num_classes
         self.lambda_coord = lambda_coord
+        self.lambda_obj = lambda_obj
+        self.lambda_class = lambda_class
         self.lambda_noobj = lambda_noobj
+        
+        self.indexOfBoxAfter = self.numOfClasses + (self.numOfBox * 4)
+        self.indexOfBoxBefore = self.numOfClasses
 
     def coordinate_loss(self, pred_xywh, true_xywh):
-        coord_loss = torch.sum((pred_xywh - true_xywh) ** 2, dim=4)
-        return (self.lambda_obj) * coord_loss
-
+        # pred_xywh, true_xywh 都是 (B, S, S, B, 4)，包含 [tx, ty, t_sqrt(w), t_sqrt(h)]
+        
+        # 1. XY Loss (L2 損失)
+        xy_loss = (pred_xywh[..., :2] - true_xywh[..., :2]) ** 2
+        xy_loss_sum = torch.sum(xy_loss, dim=-1) # (B, S, S, B)
+        
+        # 2. WH Loss (sqrt 形式的 L2 損失)
+        wh_loss = (pred_xywh[..., 2:] - true_xywh[..., 2:]) ** 2
+        wh_loss_sum = torch.sum(wh_loss, dim=-1) # (B, S, S, B)
+        
+        coord_raw_loss = xy_loss_sum + wh_loss_sum
+        
+        # 應用 lambda_coord = 5
+        return self.lambda_coord * coord_raw_loss
+    
     def object_loss(self, iou, pred_conf):
-        return self.lambda_coord * torch.sum((pred_conf - iou) ** 2, dim=3, keepdim=True)
+        # element-wise (B,S,S,B) 供 mask 後再彙總
+        return self.lambda_obj * (pred_conf - iou) ** 2
 
     def noobject_loss(self, iou, pred_conf):
-        return self.lambda_noobj * torch.sum((pred_conf - iou) ** 2, dim=3, keepdim=True)
+        # noobj 的目標是 0（貼近 YOLOv1 設定）
+        return self.lambda_noobj * (pred_conf ** 2)
 
     def class_loss(self, pred_classes, true_classes):
         # 將 true_classes 從 one-hot 轉換為類別索引
@@ -53,69 +111,84 @@ class YOLOv1Loss(torch.nn.Module):
     def forward(self, y_pred, y_true):
         
         batch_size = y_pred.shape[0]
-        y_pred = y_pred.view(-1, 7, 7, 30)
+        y_pred = y_pred.view(batch_size, self.grid, self.grid, (self.numOfBox* 5)+self.numOfClasses )
+        y_true = y_true.view(batch_size, self.grid, self.grid, (self.numOfBox* 5)+self.numOfClasses )
 
-        ypred_bbox_offset = y_pred[..., 20:28].view(-1, 7, 7, 2, 4)
-        ytrue_bbox_offset = y_true[..., 20:28].view(-1, 7, 7, 2, 4)
+        # bbox offset: (B, S, S, B, 4)
+        ypred_bbox_offset = y_pred[..., self.indexOfBoxBefore:self.indexOfBoxAfter] \
+                                .view(batch_size, self.grid, self.grid, self.numOfBox, 4)
+        # xy 使用線性輸出（貼近原 YOLOv1），wh 維持線性（sqrt wh）
+        ytrue_bbox_offset = y_true[..., self.indexOfBoxBefore:self.indexOfBoxAfter] \
+                                .view(batch_size, self.grid, self.grid, self.numOfBox, 4)
 
-        grid_offsets = tools.grid().expand(batch_size,-1,-1,-1).unsqueeze(-1).to(y_pred.device)
-        zzz = ypred_bbox_offset[..., :2]
-        ypred_bbox = torch.cat([ypred_bbox_offset[..., :2] + grid_offsets, 
-                                ypred_bbox_offset[..., 2:]], dim=-1)
-        ytrue_bbox = torch.cat([ytrue_bbox_offset[..., :2] + grid_offsets, 
-                                ytrue_bbox_offset[..., 2:]], dim=-1)
+        # xy 轉成 0~1 的比例座標，wh 先平方回真實比例（論文使用 sqrt w/h）
+        ypred_bbox = tools.decode_bbox_offsets(ypred_bbox_offset, grid_size=self.grid)
+        ytrue_bbox = tools.decode_bbox_offsets(ytrue_bbox_offset, grid_size=self.grid)
 
-        respon_mask = (y_true[..., 28:] > 0).float()
+        # 標註的物件存在與否（每 box 一個 conf 標籤）
+        label_response = (y_true[..., self.indexOfBoxAfter:] > 0).float()  # (B,7,7,2)
 
-        conf_pred = y_pred[..., 28:].view(-1, 7, 7, 2)
+        # conf 線性輸出，貼近原論文（confidence = Pr(obj)*IoU）
+        conf_pred = y_pred[..., self.indexOfBoxAfter:]
         iou_between_pred_true_box = tools.calc_iou(ypred_bbox, ytrue_bbox).to(y_pred.device)
         # iou_between_pred_true_box: (B, 7, 7, 2)
         best_box = torch.argmax(iou_between_pred_true_box, dim=-1)  # shape: (B, 7, 7)
 
-        # one-hot 轉成 mask: (B, 7, 7, 2)
-        object_mask = torch.nn.functional.one_hot(best_box, num_classes=2).float()
+        # cell 是否有物體（論文一 cell 只有一個物體）
+        has_obj = (label_response.sum(dim=-1, keepdim=True) > 0).float()  # (B,7,7,1)
+        # 負責的 box：IoU 最大者且 cell 內有物體
+        object_mask = torch.nn.functional.one_hot(best_box, num_classes=self.numOfBox).float() * has_obj  # (B,7,7,2)
+        # 非負責：其餘 box（包含空 cell 全部 box），需學成 no-object
+        noobject_mask = 1.0 - object_mask
 
-        # 把 mask 跟 respon_mask 結合，respon_mask shape: (B, 7, 7, 1)
-        object_mask = object_mask * respon_mask  # shape: (B, 7, 7, 2)
+        # 使用 raw offset 空間計算 coordinate loss（論文設定）
+        coord_loss = torch.sum(self.coordinate_loss(ypred_bbox_offset, ytrue_bbox_offset) * object_mask, dim=3)
+        # 逐 box 計算後再套 mask，避免把兩個 box 的損失混在一起
+        object_loss = torch.sum(self.object_loss(iou_between_pred_true_box, conf_pred) * object_mask, dim=3)
+        no_object_loss = torch.sum(self.noobject_loss(iou_between_pred_true_box, conf_pred) * noobject_mask, dim=3)
 
-        # 反過來是 no-object
-        noobject_mask = 1 - object_mask
-
-        coord_loss = torch.sum(self.coordinate_loss(ypred_bbox_offset, ytrue_bbox_offset) * object_mask, dim=-1)
-        object_loss = torch.sum(self.object_loss(conf_pred, iou_between_pred_true_box) * object_mask, dim=-1)
-        no_object_loss = torch.sum(self.noobject_loss(conf_pred, iou_between_pred_true_box) * noobject_mask, dim=-1)
-
-        pred_class = y_pred[..., :20].view(-1, 7, 7, 20)
-        true_class = y_true[..., :20].view(-1, 7, 7, 20)
-        class_loss = self.class_loss(pred_class, true_class) * respon_mask[..., 0]
+        pred_class = y_pred[..., :self.indexOfBoxBefore]
+        true_class = y_true[..., :self.indexOfBoxBefore]
+        # 類別使用 softmax 後的 MSE，僅在有物體的 cell 上計算（論文設定）
+        cell_obj_mask = (label_response.sum(dim=-1) > 0).float()      # (B,S,S)
+        pred_class_prob = torch.softmax(pred_class, dim=-1)
+        class_loss = self.lambda_class * torch.sum((pred_class_prob - true_class) ** 2, dim=-1)
+        class_loss = class_loss * cell_obj_mask                    # (B,S,S)
 
         loss = torch.sum(coord_loss + object_loss + no_object_loss + class_loss, dim=[1, 2]) 
+        # 紀錄 loss 組成方便除錯
+        self.last_terms = {
+            "coord": coord_loss.mean().detach(),
+            "object": object_loss.mean().detach(),
+            "noobj": no_object_loss.mean().detach(),
+            "class": class_loss.mean().detach(),
+            "total": loss.mean().detach(),
+        }
         return loss.mean()
     
 class YOLOv1Head(nn.Module):
     def __init__(self, 
                  orig_img_size,
+                 grid=7,
+                 numOfBox=2,
                  class_num=20,
-                 iou_threshold=1.0,
-                 scores_threshold=0.8,
+                 iou_threshold=0.5,
+                 scores_threshold=0.05,
+                 apply_nms=True,
                  yolo_img_size=(224, 224),
                  name='yolov1_head'):
         super(YOLOv1Head, self).__init__()
+        self.numOfBox = numOfBox
+        self.grid = grid
         self.iou_threshold = iou_threshold
         self.scores_threshold = scores_threshold
+        self.apply_nms = apply_nms
         self.yolo_img_size = torch.tensor(yolo_img_size, dtype=torch.float32)
         self.orig_img_size = torch.tensor(orig_img_size, dtype=torch.float32)
         self.class_num = class_num
 
     @staticmethod
     def nms(boxes, iou_threshold, scores_threshold):
-        """
-        Non-Max Suppression for the given boxes.
-        Args:
-            boxes: Tensor of shape (N, 6) -> [class, x1, y1, x2, y2, score]
-            iou_threshold: IoU threshold for suppression
-            scores_threshold: Minimum score threshold for valid boxes
-        """
         pred_box = boxes[:, 1:5]
         pred_scores = boxes[:, -1]
         keep_idx = torch.ops.torchvision.nms(pred_box, pred_scores, iou_threshold)
@@ -125,61 +198,89 @@ class YOLOv1Head(nn.Module):
 
     def preprocess_boxes(self, inputs_ts):
         """
-        Preprocess predictions to convert from YOLO format to box format.
-        Args:
-            inputs_ts: Tensor of shape (batch, grid_size, grid_size, 5*B + C)
-        Returns:
-            pred_boxes: Tensor of shape (N, 6) -> [class, x1, y1, x2, y2, score]
+        inputs_ts: (B, S, S, C + 5B) = (B,7,7,30)
+        layout: [0:C]=class, [C:C+4B]=boxes, [C+4B:C+5B]=conf
+        回傳: pred_boxes (N, 6) -> [class, x1, y1, x2, y2, score]（座標在原圖 pixel 空間）
+              batch_ids (N,) -> 對應哪一張圖（避免跨 batch 做 NMS）
         """
-        batch_size, grid_size, _, _ = inputs_ts.shape
-        feature_hw = torch.tensor([grid_size, grid_size], dtype=torch.float32)
+        device = inputs_ts.device
+        B, S, _, D = inputs_ts.shape
+        C = self.class_num
+        Bbox = self.numOfBox
 
-        # Extract predictions
-        pred_classes = inputs_ts[..., :self.class_num]
-        pred_xywh = inputs_ts[..., self.class_num:self.class_num + 4]
-        pred_conf = inputs_ts[..., -1:]
+        assert D == C + 5 * Bbox, f"expect last dim {C + 5*Bbox}, got {D}"
 
-        # Generate grid and normalize
-        grid = tools.grid().to(inputs_ts.device)
-        pred_xy = (pred_xywh[..., :2] + grid) / feature_hw[0]
-        pred_wh = torch.exp(pred_xywh[..., 2:]) / feature_hw[1]
+        # 1. 切出 class / box offset / conf
+        pred_cls = inputs_ts[..., :C]                       # (B,S,S,C)
+        pred_boxes_offset = inputs_ts[..., C:C+4*Bbox]      # (B,S,S,8)
+        pred_boxes_offset = pred_boxes_offset.view(B, S, S, Bbox, 4)  # (B,S,S,B,4)
+        pred_xy = pred_boxes_offset[..., :2]
+        pred_wh = pred_boxes_offset[..., 2:]                          # wh 預測 sqrt，線性輸出
+        pred_boxes_offset = torch.cat([pred_xy, pred_wh], dim=-1)      # wh 為 sqrt 比例
+        # conf 與訓練一致，線性輸出（YOLOv1 原設定：預測 IoU）
+        pred_conf = inputs_ts[..., C+4*Bbox:C+5*Bbox]       # (B,S,S,B)
 
-        # Convert to (x1, y1, x2, y2)
-        pred_x1y1 = pred_xy - pred_wh / 2
-        pred_x2y2 = pred_xy + pred_wh / 2
-        pred_box = torch.cat([pred_x1y1, pred_x2y2], dim=-1)
+        # 2. 轉成 center xy in [0,1]、wh ~ [0,1]（與 loss 共用 decode）
+        xywh = tools.decode_bbox_offsets(pred_boxes_offset, grid_size=self.grid)  # (B,S,S,B,4)
 
-        # Compute scores
-        pred_scores = torch.max(pred_classes * pred_conf, dim=-1).values
-        pred_class_indices = torch.argmax(pred_classes, dim=-1).float()
+        x1y1 = xywh[..., :2] - xywh[..., 2:] / 2.0
+        x2y2 = xywh[..., :2] + xywh[..., 2:] / 2.0
+        boxes_norm = torch.cat([x1y1, x2y2], dim=-1)        # (B,S,S,B,4)，座標 0~1
+        boxes_norm = torch.clamp(boxes_norm, 0.0, 1.0)       # 避免出界的亂框
 
-        # Combine results
-        pred_boxes = torch.cat([
-            pred_class_indices.unsqueeze(-1),
-            pred_box.view(-1, 4),
-            pred_scores.unsqueeze(-1)
-        ], dim=-1)
+        # 4. class prob per cell → broadcast 到 box 維度
+        cls_prob = F.softmax(pred_cls, dim=-1)              # (B,S,S,C)
+        cls_prob = cls_prob.unsqueeze(3).expand(B, S, S, Bbox, C)  # (B,S,S,B,C)
 
-        return pred_boxes
+        # 5. 針對「每個類別」計算 score = class_prob * conf，避免只保留單一最大類別
+        cls_ids = torch.arange(C, device=device).view(1, 1, 1, 1, C)
+        cls_ids = cls_ids.expand(B, S, S, Bbox, C)                   # (B,S,S,B,C)
+        scores = cls_prob * pred_conf.unsqueeze(-1)                  # (B,S,S,B,C)
+
+        # 6. 展平所有 box×class（總數 B*S*S*Bbox*C），再縮放到原圖座標
+        boxes_norm_flatten = boxes_norm.unsqueeze(4)                 # (B,S,S,B,1,4)
+        boxes_norm_flatten = boxes_norm_flatten.expand(B, S, S, Bbox, C, 4)
+        boxes_norm_flatten = boxes_norm_flatten.reshape(-1, 4)       # (N,4)
+        scores_flatten = scores.reshape(-1, 1)                       # (N,1)
+        cls_idx_flatten = cls_ids.reshape(-1, 1).float()             # (N,1)
+
+        # batch id 標籤，避免跨 batch NMS
+        batch_ids = torch.arange(B, device=device).view(B, 1, 1, 1, 1)
+        batch_ids = batch_ids.expand(B, S, S, Bbox, C).reshape(-1)
+
+        # 7. Scale 和 Concatenate (保持原來的縮放邏輯)
+        H, W = self.orig_img_size.to(device)
+        scale = torch.tensor([W, H, W, H], device=device)
+        boxes_xyxy = boxes_norm_flatten * scale          # (N,4)
+
+        pred_boxes = torch.cat([cls_idx_flatten, boxes_xyxy, scores_flatten], dim=-1) # (N,6)
+        return pred_boxes, batch_ids
 
     def forward(self, inputs_ts):
-        """
-        Forward pass for the YOLOv1 head.
-        Args:
-            inputs_ts: Tensor of shape (batch, grid_size, grid_size, 5*B + C)
-        Returns:
-            result_boxes: Tensor of shape (N, 6) -> [class, x1, y1, x2, y2, score]
-        """
-        pred_boxes = self.preprocess_boxes(inputs_ts)
-        result_boxes = torch.zeros((0, 6), device=inputs_ts.device)
+        pred_boxes, batch_ids = self.preprocess_boxes(inputs_ts)
+        B = inputs_ts.size(0)
+        results = []
 
-        # Apply NMS per class
-        for i in range(self.class_num):
-            class_mask = (pred_boxes[:, 0] == i)
-            _pred_boxes = pred_boxes[class_mask]
-            if _pred_boxes.shape[0] == 0:
+        for b in range(B):
+            result_boxes = torch.zeros((0, 6), device=inputs_ts.device)
+            batch_mask = (batch_ids == b)
+            if not batch_mask.any():
+                results.append(result_boxes)
                 continue
-            nms_boxes = self.nms(_pred_boxes, self.iou_threshold, self.scores_threshold)
-            result_boxes = torch.cat([result_boxes, nms_boxes], dim=0)
+            pred_boxes_b = pred_boxes[batch_mask]
 
-        return result_boxes
+            for i in range(self.class_num):
+                class_mask = (pred_boxes_b[:, 0] == float(i))
+                _pred_boxes = pred_boxes_b[class_mask]
+                if _pred_boxes.shape[0] == 0:
+                    continue
+                if self.apply_nms:
+                    keep_boxes = self.nms(_pred_boxes, self.iou_threshold, self.scores_threshold)
+                else:
+                    keep_boxes = _pred_boxes[_pred_boxes[:, -1] >= self.scores_threshold]
+                result_boxes = torch.cat([result_boxes, keep_boxes], dim=0)
+            results.append(result_boxes)
+
+        if B == 1:
+            return results[0]
+        return results

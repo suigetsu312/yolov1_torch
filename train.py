@@ -1,64 +1,161 @@
+import os
 import torch
+import torch.optim as optim
+from torchvision import transforms
+from torchvision.transforms import Compose, ToTensor, Normalize, ColorJitter
+from torch.utils.tensorboard import SummaryWriter
+
 import model
 import pascal_dataloader
-import torch.optim as optim
-from torchvision.transforms import Compose, ToTensor, Normalize
-# 假設訓練完成後，將模型和優化器狀態保存為檢查點
-def save_checkpoint(model, optimizer, epoch, loss, checkpoint_path):
+import tools
+
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, global_step, checkpoint_path):
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'loss': loss,
+        'global_step': global_step,
     }
     torch.save(checkpoint, checkpoint_path)
-    print(f"Checkpoint saved at epoch {epoch}")
+    print(f"[Checkpoint] saved at epoch {epoch+1}: {checkpoint_path}")
 
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    EPOCHS = 135
+    BASE_LR = 1e-2
+    TRAIN_TXT = "/home/natsu/dataset/VOC0712_merged/train.txt"
+    VAL_TXT   = "/home/natsu/dataset/VOC0712_merged/test.txt"
+    BS_TRAIN = 16     # 實際 batch
+    BS_VAL   = 1     # evaluate_map 假設 1
+    map_interval = 150          # 每 N 個 epoch 評估一次 mAP
+    checkpoint_interval = 10    # 每 N 個 epoch 儲存 checkpoint
+    IMG_SIZE = 448
+    ACCUM_STEPS = 4  # 梯度累積步數（有效 batch ≈ BS_TRAIN * ACCUM_STEPS）
+    # 等比例縮放 LR：目標有效 batch ~64，原 base LR 0.01 → scale = (BS*ACCUM)/64
+    LR_SCALE = (BS_TRAIN * ACCUM_STEPS) / 64.0
+    LR = BASE_LR * LR_SCALE
+    RESUME_PATH = "checkpoints/last.pth"
+
+    train_transform = Compose([
+        tools.BGR2RGB(),
+        ToTensor(),
+        # 輕量 affine 讓比例/位置更隨機，貼近參考版的平移縮放
+        transforms.RandomAffine(degrees=5, translate=(0.1, 0.1), scale=(0.9, 1.1), shear=2),
+        ColorJitter(brightness=0.25, contrast=0.25, saturation=0.25, hue=0.05),
+        Normalize(mean=[0.485, 0.456, 0.406],
+                  std=[0.229, 0.224, 0.225])
+    ])
+
+    val_transform = Compose([
+        tools.BGR2RGB(),
+        ToTensor(),
+        Normalize(mean=[0.485, 0.456, 0.406],
+                  std=[0.229, 0.224, 0.225])
+    ])
+
+    train_dataset = pascal_dataloader.PascalDataset(
+        txt_sample_path=TRAIN_TXT,
+        transform=train_transform,
+        img_size=IMG_SIZE,
+        hflip_prob=0.5
+    )
+    train_loader = train_dataset.create_dataloader(batch_size=BS_TRAIN, shuffle=True)
+
+    val_dataset = pascal_dataloader.PascalDataset(
+        txt_sample_path=VAL_TXT,
+        transform=val_transform,
+        img_size=IMG_SIZE,
+        hflip_prob=0.0   # 驗證不做增強
+    )
+    val_loader = val_dataset.create_dataloader(batch_size=BS_VAL, shuffle=False)
+
+    net = model.YOLOv1().to(device)
+    criterion = model.YOLOv1Loss()
+    optimizer = optim.SGD(net.parameters(), lr=LR, momentum=0.9, weight_decay=5e-4)
+    scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[75, 105], gamma=0.1)
+    warmup_epochs = 3
+
+    start_epoch = 0
+    global_step = 0
+    if os.path.isfile(RESUME_PATH):
+        print(f"[Resume] Loading checkpoint from {RESUME_PATH}")
+        ckpt = torch.load(RESUME_PATH, map_location=device)
+        net.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if ckpt.get("scheduler_state_dict") is not None:
+            scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        start_epoch = ckpt.get("epoch", -1) + 1
+        global_step = ckpt.get("global_step", 0)
+        print(f"[Resume] start at epoch {start_epoch}, global_step {global_step}")
+
+    head = model.YOLOv1Head(orig_img_size=(IMG_SIZE, IMG_SIZE),
+                            iou_threshold=0.5,
+                            scores_threshold=0.05)  # head 沒參數，不用放 device
+
+    log_dir = "runs/yolov1_voc"
+    os.makedirs(log_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=log_dir)
+    # 若從 checkpoint 恢復，global_step 已在上方載入
+    for epoch in range(start_epoch, EPOCHS):
+        # 論文沒有 warmup，但用較大 LR + 448 輸入時，加個簡單 warmup 稳定訓練（僅從頭訓練時啟用）
+        if start_epoch == 0 and epoch < warmup_epochs:
+            lr_scale = float(epoch + 1) / warmup_epochs
+            for pg in optimizer.param_groups:
+                pg['lr'] = LR * lr_scale
+        net.train()
+        epoch_loss_sum = 0.0
+        optimizer.zero_grad()
+
+        for batch_idx, (images, labels) in enumerate(train_loader):
+            images = images.to(device)
+            labels = labels.to(device).float()
+
+            preds = net(images)
+            loss = criterion(preds, labels) / ACCUM_STEPS
+
+            loss.backward()
+            if (batch_idx + 1) % ACCUM_STEPS == 0 or (batch_idx + 1) == len(train_loader):
+                torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=10.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            epoch_loss_sum += loss.item() * ACCUM_STEPS
+            writer.add_scalar("train/loss_step", loss.item() * ACCUM_STEPS, global_step)
+            global_step += 1
+
+        avg_loss = epoch_loss_sum / len(train_loader)
+        writer.add_scalar("train/loss_epoch", avg_loss, epoch)
+        print(f"[Epoch {epoch+1}/{EPOCHS}] Train Loss: {avg_loss:.4f}")
+        scheduler.step()
+        val_map = None
+        if (epoch + 1) % map_interval == 0:
+            # mAP@0.5，用 head 的輸出
+            val_map = tools.evaluate_map(
+                model=net,
+                head=head,
+                dataloader=val_loader,
+                device=device,
+                num_classes=20,
+                img_size=IMG_SIZE,
+                iou_thr=0.5
+            )
+            writer.add_scalar("val/mAP@0.5", val_map, epoch)
+            print(f"[Epoch {epoch+1}/{EPOCHS}] Val mAP@0.5: {val_map:.4f}")
+
+        if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == EPOCHS:
+            ckpt_path = os.path.join("checkpoints", f"yolov1_epoch_{epoch+1}.pth")
+            os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+            save_checkpoint(net, optimizer, scheduler, epoch, avg_loss, global_step, ckpt_path)
+            save_checkpoint(net, optimizer, scheduler, epoch, avg_loss, global_step, RESUME_PATH)
+
+    writer.close()
+    print("Training complete!")
 
 if __name__ == "__main__":
-    # 檢查是否有可用的 GPU
-    if torch.cuda.is_available():
-        device = torch.device("cuda")  # 使用 GPU
-    else:
-        device = torch.device("cpu")  # 使用 CPU
-
-    EPOCHS = 172
-    LEARNING_RATE = 1e-4
-    transform = Compose([
-        ToTensor(),
-        Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-    dataset = pascal_dataloader.PascalDataset(
-            txt_sample_path="D:\\prog\\od\\data\\train.txt",
-            transform=transform  # 可傳入你的影像轉換
-        )
-    dataloader = dataset.create_dataloader(batch_size=16)
-    yolov1_model = model.YOLOv1()
-    yolov1_model.to(device)
-    yolov1_loss = model.YOLOv1Loss()
-    optimizer = optim.Adam(yolov1_model.backborn.parameters(), lr=LEARNING_RATE)
-
-    for epoch in range(EPOCHS):
-        yolov1_model.train()
-        epoch_loss = 0
-
-        for images, labels in dataloader:
-            images = images.to(device)
-            labels = labels.to(device)
-            # 向前傳播
-            predictions = yolov1_model(images)
-
-            # 計算損失
-            loss = yolov1_loss(predictions, labels)
-
-            # 反向傳播
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            epoch_loss += loss.item()
-
-        print(f"Epoch {epoch+1}/{EPOCHS}, Loss: {epoch_loss:.4f}")
-        save_checkpoint(yolov1_model, optimizer, epoch, epoch_loss, 'checkpoint'+str(epoch+1)+'.pth')
-
-    print("Training complete!")
+    main()
